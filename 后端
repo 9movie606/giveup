@@ -1,0 +1,1293 @@
+/**
+ * Senflare Link Lite - 子后端 v4.2.0-node
+ */
+
+import { connect } from 'cloudflare:sockets';
+
+// ==================== 1. 核心凭证 ====================
+
+const AdminVersion = 'v4.2.0';   // 版本
+const SyncKey = '1f1825d651b701d611b4fdc4344fdceec29f972cfc37b97d'; // 子后端通信密钥（须与主后端一致，二创请修改）
+
+// ==================== 2. 全局配置 ====================
+
+const NodeDefaults = {
+
+  UUID: 'b69cf773-da16-486e-afce-a45b94f998b3',   // 订阅凭证（与主后端同步；优先级：D1 > 内置默认值）
+
+  ProxyIPMode: 'OFFICIAL',  // 反代模式: OFFICIAL(官方匹配) / AUTO(智能匹配) / 固定地区码(池内18区) / CUSTOM(自定义出口) / LOCAL(在线优选)
+  ProxyIP: 'https://proxy.seeck.cn/api/nodes?region=SG,HK&limit=10&format=brand',
+  LocalProxyIP: '',       // Local 模式的在线优选出口
+  ProxyIPMax: 'Proxy-Auto.SenflareLink.kdns.fr', // 兜底反代（所有模式失效时回退）
+  Outbound: 'auto',       // 出站模式: auto(智能分流) / global(全局反代落地,含兜底) / fixed(锁定单反代,无兜底)
+  Doh: 'auto',            // DoH 劫持: auto(双端点竞速) / 自定义单端点 URL
+  Cache: true,            // 配置缓存总开关
+};
+
+/** 配置键白名单（FirstByteTimeout 仅 D1 手工写入，不在主后端推送列表） */
+const ConfigKeys = ['UUID', 'ProxyIPMode', 'ProxyIP', 'LocalProxyIP', 'ProxyIPMax', 'Outbound', 'Doh', 'Cache', 'FirstByteTimeout'];
+
+/** 配置缓存时长（5 分钟） */
+const ConfigTtl = 5 * 60 * 1000;
+
+// ==================== 3. 运行时状态与配置加载 ====================
+
+/** 运行时 env 引用（fetch 入口捕获） */
+let runtimeEnv = null;
+
+/** 全局编解码器 */
+const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+/** 恒定时间字符串比较 */
+const safeEqual = (a, b) => {
+  const x = String(a ?? ''), y = String(b ?? '');
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return diff === 0;
+};
+
+/** 节点配置缓存 */
+let nodeConf = null;
+let nodeConfTime = 0;
+/** 配置加载去重 */
+let nodeConfInflight = null;
+
+/** D1 故障退避 */
+let nodeConfFailUntil = 0;
+
+/** 配置代数：推送落库后推进，用于丢弃读取快照早于本次提交的在途加载 */
+let confGeneration = 0;
+
+const normalizeOutbound = (conf) => {
+  const outbound = String(conf.Outbound ?? '').trim().toLowerCase();
+  const mode = String(conf.ProxyIPMode || '').toUpperCase();
+  if (outbound === 'fixed' && mode !== 'CUSTOM' && mode !== 'LOCAL') conf.ProxyIPMode = 'CUSTOM';
+  return conf;
+};
+
+/** 加载节点配置（5 分钟缓存 + 去重 + 30s 故障退避 + 推送代数校验） */
+const loadNodeConfig = async () => {
+  const now = Date.now();
+  const cacheOn = (nodeConf?.Cache ?? NodeDefaults.Cache) !== false;
+  if (cacheOn && nodeConf && now - nodeConfTime < ConfigTtl) return nodeConf;
+  if (cacheOn && now < nodeConfFailUntil) return nodeConf ?? { ...NodeDefaults };
+  if (nodeConfInflight) return nodeConfInflight;
+  nodeConfInflight = (async () => {
+    // 推送竞态防护：读取期间 handleSyncConfig 落库会推进代数，本次快照即过期，弃用重读
+    // （推送先提交后推进代数，重读必然读到已提交的新值；校验与回填同 tick 无插入点）
+    for (let gen = confGeneration; ;) {
+      const conf = { ...NodeDefaults };
+      let loaded = false;
+      const db = runtimeEnv?.Senflare;
+      if (db) {
+        try {
+          const placeholders = ConfigKeys.map(() => '?').join(',');
+          const { results } = await db
+            .prepare(`SELECT key, value FROM config WHERE key IN (${placeholders})`)
+            .bind(...ConfigKeys)
+            .all();
+          for (const row of results) {
+            try {
+              conf[row.key] = JSON.parse(row.value);
+            } catch {
+              conf[row.key] = row.value;
+            }
+          }
+          loaded = true;
+        } catch { }
+      } else {
+        loaded = true; // 无 D1 绑定：纯默认即最终配置
+      }
+
+      if (loaded && gen === confGeneration) {
+        normalizeOutbound(conf);   // fixed + 非 CUSTOM/LOCAL 回落 CUSTOM
+        nodeConf = conf;
+        nodeConfTime = Date.now();
+        return conf;
+      }
+      if (!loaded) {
+        nodeConfFailUntil = Date.now() + 30 * 1000; // 故障退避：30 秒
+        return nodeConf ?? conf;
+      }
+      gen = confGeneration;   // 快照过期：再读一轮
+    }
+  })();
+  try {
+    return await nodeConfInflight;
+  } finally {
+    nodeConfInflight = null;
+  }
+};
+
+/** 生效 UUID：优先级 D1 > 内置默认值 */
+const isValidUuid = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+const getUuid = () => {
+  const cfg = String(nodeConf?.UUID || '').trim();
+  return isValidUuid(cfg) ? cfg.toLowerCase() : NodeDefaults.UUID;
+};
+
+/** UUID 二进制（16 字节）*/
+let uuidBytesFor = '';
+let uuidBytes = null;
+const getUuidBytes = () => {
+  const uuid = getUuid();
+  if (uuidBytesFor !== uuid) {
+    uuidBytes = Uint8Array.from(uuid.replace(/-/g, '').match(/../g), (hex) => parseInt(hex, 16));
+    uuidBytesFor = uuid;
+  }
+  return uuidBytes;
+};
+
+// ==================== 4. 通用工具 ====================
+
+/** 二进制地址转字符串（addrType：1=IPv4 / 2=域名 / 3=IPv6） */
+const binaryAddrToString = (addrType, addrBytes) => {
+  if (addrType === 2) return textDecoder.decode(addrBytes);
+  if (addrType === 1) return `${addrBytes[0]}.${addrBytes[1]}.${addrBytes[2]}.${addrBytes[3]}`;
+  let ipv6 = ((addrBytes[0] << 8) | addrBytes[1]).toString(16);
+  for (let i = 1; i < 8; i++) ipv6 += ':' + ((addrBytes[i * 2] << 8) | addrBytes[i * 2 + 1]).toString(16);
+  return `[${ipv6}]`;
+};
+
+/** 解析 host:port 条目（支持 IPv6 [host]:port；#备注忽略） */
+const parseHostPort = (entry) => {
+  const raw = String(entry || '').trim();
+  if (!raw) return null;
+  const endpoint = raw.split('#')[0].trim();
+  let host = endpoint;
+  let port = null;
+  if (endpoint.charCodeAt(0) === 91) {
+    // IPv6: [host]:port
+    const idx = endpoint.indexOf(']:');
+    if (idx !== -1) {
+      host = endpoint.substring(0, idx + 1);
+      port = parseInt(endpoint.substring(idx + 2)) || null;
+    }
+  } else {
+    const idx = endpoint.lastIndexOf(':');
+    if (idx !== -1) {
+      host = endpoint.substring(0, idx);
+      port = parseInt(endpoint.substring(idx + 1)) || null;
+    }
+  }
+  return host ? { host, port } : null;
+};
+
+/** 带超时的 fetch */
+const fetchWithTimeout = async (url, timeout = 8000, init = {}) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// ==================== 5. 主入口与路由 ====================
+
+export default {
+  async fetch(request, env) {
+    runtimeEnv = env;
+
+    // 配置推送接收（密钥不符 404）
+    if (request.method === 'POST' && (new URL(request.url)).pathname === '/api/sync/receive-config') {
+      return handleSyncConfig(request);
+    }
+
+    // XHTTP 优先
+    const ct = (request.headers.get('content-type') || '').split(';')[0].trim();
+    if (request.method === 'POST' && /^application\/grpc/.test(ct)) {
+      await loadNodeConfig();
+      return handleXwebPost(request);
+    }
+
+    // WebSocket
+    if (request.headers.get('Upgrade') === 'websocket') {
+      // 先加载配置再握手
+      await loadNodeConfig();
+      const { 0: clientSocket, 1: webSocket } = new WebSocketPair();
+      webSocket.binaryType = 'arraybuffer';
+      webSocket.accept();
+      handleWebSocketConn(webSocket, request);
+      return new Response(null, { status: 101, webSocket: clientSocket, headers: { 'Sec-WebSocket-Extensions': '' } });
+    }
+    // 其余请求：转发至伪装目标 FakeUrl
+    return handleFakePage(request);
+  },
+};
+
+/** 未知路由响应（200 纯文本） */
+function unknownResp() {
+  return new Response(
+    'Senflare Link\n客官，请走正门哦，不要再试探我啦~\n简睿 TG：https://t.me/Senflare',
+    { status: 200, headers: { 'content-type': 'text/plain; charset=UTF-8' } }
+  );
+}
+
+/** 跨账号配置推送接收（POST /api/sync/receive-config；X-Sync-Key 鉴权） */
+const handleSyncConfig = async (request) => {
+  const db = runtimeEnv?.Senflare;
+  if (!safeEqual(request.headers.get('X-Sync-Key'), SyncKey)) return new Response('Not Found', { status: 404 });
+  const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+  if (!db) return json({ error: '未绑定 D1，无法接收配置' }, 503);
+  // 推送体上限：白名单键值全是短内容，64KB 绰绰有余，防异常大包进 JSON 解析
+  if (Number(request.headers.get('content-length') || 0) > 65536) return json({ error: '推送体过大' }, 413);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: '参数错误' }, 400); }
+  const entries = Object.entries(body && typeof body === 'object' ? body : {})
+    .filter(([k, v]) => ConfigKeys.includes(k) && ['string', 'boolean', 'number'].includes(typeof v));
+  if (!entries.length) return json({ error: '无有效配置项' }, 400);
+  const enc = (v) => (typeof v === 'string' ? v : JSON.stringify(v));
+  const upsert = 'INSERT INTO config (key, value, updatedAt) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt';
+  const runBatch = () => {
+    const now = Date.now();
+    return db.batch(entries.map(([k, v]) => db.prepare(upsert).bind(k, enc(v), now)));
+  };
+  try {
+    await runBatch();
+  } catch {
+    // 缺表时补建一次再试
+    try {
+      await db.prepare('CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updatedAt INTEGER NOT NULL)').run();
+      await runBatch();
+    } catch { return json({ error: '写入失败' }, 500); }
+  }
+  nodeConf = null;  // 立即失效缓存
+  nodeConfTime = 0;
+  nodeConfFailUntil = 0;
+  confGeneration++;   // 推进代数：读取快照早于本次提交的在途加载将被弃用重读，防止旧值回填
+  return json({ success: true, version: AdminVersion });   // 供主后端版本对账
+};
+
+// ==================== 6. 会话入口：WebSocket / XHTTP ====================
+
+const handleWebSocketConn = async (webSocket, request) => {
+  const hostHeader = request.headers.get('host') || '';
+  const referer = request.headers.get('Referer');
+  let earlyDataHeader = request.headers.get('sec-websocket-protocol');
+  if (!earlyDataHeader && referer && hostHeader) {
+    // Referer 早数据：完整 URL 解析后比对 host（直接 startsWith(host) 对带 scheme 的 Referer 永假）
+    try {
+      const refUrl = new URL(referer);
+      if (refUrl.host === hostHeader) {
+        const tail = (refUrl.pathname + refUrl.search).replace(/^\/+/, '');
+        earlyDataHeader = tail || null;
+      }
+    } catch { }   // 畸形 Referer 视作无早数据
+  }
+  let earlyData = null;
+  if (earlyDataHeader) {
+    try {
+      earlyData = Uint8Array.fromBase64(earlyDataHeader, { alphabet: 'base64url', lastChunkHandling: 'loose' });
+    } catch { }   // 畸形 early-data 直接丢弃：异常抛出会让已 accept 的 WebSocket 成无人接管
+  }
+  const state = { upQueue: null, tcpSocket: null, udpRemain: null, tcpDns: null, dnsRemain: null, dnsIdleTimer: null, exitKey: null };
+  let closing = false;
+  const finalizeClose = () => {
+    state.dnsIdleTimer && (clearTimeout(state.dnsIdleTimer), (state.dnsIdleTimer = null));
+    try { state.tcpSocket?.close(); } catch { }
+  };
+  // silent=true：服务端主动掐线，静默回收不发 close 帧；silent=false：会话正常完成，发 1000 关闭
+  const close = (silent) => {
+    if (closing) return;
+    closing = true;
+    if (!silent) {
+      try { webSocket.close(1000); } catch { }
+    }
+    state.upQueue ? state.upQueue.onIdle(finalizeClose) : finalizeClose();
+  };
+  const processingQueue = createAsyncMicrotaskQueue((chunk) => handleSession(chunk, state, request, webSocket, close), close);
+  state.upQueue = processingQueue;
+  if (earlyData) processingQueue(earlyData);
+  webSocket.addEventListener('message', (event) => processingQueue(event.data));
+  webSocket.addEventListener('error', () => close(true));
+  webSocket.addEventListener('close', () => close(true));
+};
+
+const xwebHeaders = {
+  'Content-Type': 'application/octet-stream',
+  'grpc-status': '0',
+  'X-Accel-Buffering': 'no',
+  'Cache-Control': 'no-store',
+};
+
+/** XHTTP 首字节看门狗：竞速首个下行块，'timeout'=静默超时（调用方记失败记忆）、null=EOF/错误；
+ *  成功返回 { tcpReader, first }，reader 释放后其余下行仍走 pipeTo */
+const xwebFirstByte = async (socket) => {
+  const tcpReader = socket.readable.getReader();
+  const fbt = await getFirstByteTimeout();
+  const firstRead = tcpReader.read();
+  firstRead.catch(() => { });   // 竞速败者拒绝兜底
+  let watchdog;
+  const first = await Promise.race([
+    firstRead.finally(() => clearTimeout(watchdog)),
+    new Promise((resolve) => { watchdog = setTimeout(resolve, fbt); }),
+  ]).catch(() => null);
+  if (!first?.value?.byteLength) {
+    try { tcpReader.cancel().catch(() => { }); } catch { }
+    try { tcpReader.releaseLock(); } catch { }
+    return first === undefined ? 'timeout' : null;   // 仅静默超时判黑洞
+  }
+  return { tcpReader, first: first.value };
+};
+
+const handleXwebPost = async (request) => {
+  if (!request.body) return new Response(null, { status: 400 });
+  const state = { tcpSocket: null, needMore: false, xwebPipeTo: true, udpRemain: null, tcpDns: null, dnsRemain: null, dnsIdleTimer: null, exitKey: null };
+  const bridge = new IdentityTransformStream();
+  const responseWriter = bridge.writable.getWriter();
+  let xwebBuffer = new ArrayBuffer(maxChunkLen);
+  let used = 0;
+  const close = () => {
+    state.dnsIdleTimer && (clearTimeout(state.dnsIdleTimer), (state.dnsIdleTimer = null));
+    try { state.tcpSocket?.close(); } catch { }
+    if (state.xwebPipeTo) responseWriter.close().catch(() => { });
+  };
+  const writable = { send(chunk) { if (chunk?.byteLength) return responseWriter.write(chunk); } };
+  const reader = request.body.getReader({ mode: 'byob' });
+  (async () => {
+    // 首包阶段：手动拼读到建连成功
+    while (!state.tcpSocket) {
+      const readLen = used === 0 ? 16 * 1024 : maxChunkLen - used;
+      if (readLen <= 0) return close();
+      const { done, value } = await reader.read(new Uint8Array(xwebBuffer, used, readLen));
+      if (done) return close();
+      xwebBuffer = value.buffer;
+      used += value.byteLength;
+      state.needMore = false;
+      await handleSession(new Uint8Array(xwebBuffer, 0, used), state, request, writable, close);
+      if (!state.needMore) used = 0;   // 解析完成即重置
+    }
+    // 建连成功：上行剩余裸流 pipeTo
+    reader.releaseLock();
+    request.body.pipeTo(state.tcpSocket.writable).catch(close);
+    if (state.xwebPipeTo) {
+      const got = await xwebFirstByte(state.tcpSocket);
+      if (got === 'timeout') {
+        if (state.exitKey) markProxyKey(state.exitKey);   // 黑洞出口记入失败记忆
+        return close();
+      }
+      if (!got) return close();   // EOF/错误：掐断但不记出口
+      await writable.send(got.first);   // 首块落桥
+      try { got.tcpReader.releaseLock(); } catch { }
+      state.xwebPipeTo = false;
+      responseWriter.releaseLock();
+      state.tcpSocket.readable.pipeTo(bridge.writable).catch(close);
+    }
+  })().catch(close);
+  return new Response(bridge.readable, { headers: xwebHeaders });
+};
+
+// ==================== 7. 会话管理 ====================
+
+// 测速回环：目标是 CF 测速域时隧道内直接回 204
+const SPEED_TEST_HOSTS = ['speed.cloudflare.com', 'cp.cloudflare.com'];
+const isSpeedTestHost = (h) => {
+  h = String(h || '').toLowerCase();
+  return SPEED_TEST_HOSTS.some((d) => h === d || h.endsWith('.' + d));
+};
+/** 回环应答（预编码为字节） */
+const SPEED_TEST_204 = textEncoder.encode('HTTP/1.1 204 No Content\r\nconnection: keep-alive\r\n\r\n');
+
+const handleSession = async (chunk, state, request, writable, close) => {
+  // 回环模式：每收到一段数据回一个 204
+  if (state.speedLoop) {
+    if (chunk?.byteLength) await writable.send(SPEED_TEST_204);
+    return;
+  }
+  if (state.tcpDns) {
+    await feedTcpDns(chunk, state, writable, close);
+    return;
+  }
+  if (state.udpDns) {
+    await feedUdpDns(chunk, state, writable, close);
+    return;
+  }
+  state.needMore = false;
+  if (state.pendingHeader) {
+    const merged = new Uint8Array(state.pendingHeader.length + chunk.length);
+    merged.set(state.pendingHeader, 0);
+    merged.set(chunk, state.pendingHeader.length);
+    state.pendingHeader = null;
+    chunk = merged;
+  }
+  const parsed = parseProtocolChunk(chunk);
+  if (parsed.handshake) writable.send(parsed.handshake);
+  if (!parsed.success) {
+    // 仅 WS 路径留存残帧（XHTTP 由调用方缓冲）
+    if (parsed.needMore) { state.needMore = true; if (!state.xwebPipeTo) state.pendingHeader = chunk.slice(); return; }
+    return close(true);   // 鉴权失败：静默断开
+  }
+  const parsedRequest = parsed.parsedRequest;
+  const payload = chunk.subarray(parsedRequest.dataOffset);
+
+  // 53 端口：转 DoH 劫持
+  if (parsedRequest.port === 53) {
+    if (parsedRequest.cmd === 1) {
+      state.tcpDns = true;
+      await feedTcpDns(payload, state, writable, close);
+      return;
+    }
+    state.udpDns = true;
+    await feedUdpDns(payload, state, writable, close);
+    return;
+  }
+
+  // 其他 UDP/MUX：不支持，回 3 字节失败握手
+  if (parsedRequest.cmd !== 1) {
+    if (!state.unsupported) {
+      state.unsupported = true;   // 挡板：同一会话只回一次失败握手
+      await writable.send(new Uint8Array([0x00, 0x01, 0x00]));
+    }
+    return;
+  }
+
+  // 目标地址解码
+  const hostname = binaryAddrToString(parsedRequest.addrType, parsedRequest.addrBytes);
+
+  // 测速域 → 进入回环模式
+  if (isSpeedTestHost(hostname)) {
+    state.speedLoop = true;
+    await writable.send(SPEED_TEST_204);
+    return;
+  }
+
+  // 首包由 establishTcpConnection 写入
+  const tcpResult = await establishTcpConnection(parsedRequest, request, hostname, payload);
+  if (!tcpResult) return close(true);   // 建连全灭：静默回收
+  state.tcpSocket = tcpResult.socket;
+  state.exitKey = tcpResult.exitKey;   // 黑洞看门狗触发时记失败记忆
+  if (state.xwebPipeTo) return;   // XHTTP：上行由调用方接管
+  state.upQueue.writer = state.tcpSocket.writable.getWriter();
+  manualPipe(state.tcpSocket.readable, writable, close, () => state.exitKey && markProxyKey(state.exitKey)).catch(() => close(true));   // 下行异常/看门狗：静默回收
+};
+
+// ==================== 8. 协议解析 ====================
+
+/** 解析协议头：Ver(1) + UUID(16) + OptLen(1) + Opt(N) + Cmd(1) + Port(2) + AddrType(1) + Addr(N) */
+const parseProtocolChunk = (chunk) => {
+  const len = chunk.length;
+  const result = { success: false, needMore: false, handshake: null, parsedRequest: null };
+  if (len < 17) return (result.needMore = true), result;
+  const uuidKey = getUuidBytes();
+  for (let i = 0; i < 16; i++) if (chunk[i + 1] !== uuidKey[i]) return result;
+  if (len < 18) return (result.needMore = true), result;
+  const offset = 19 + chunk[17];
+  if (len < offset + 4) return (result.needMore = true), result;
+  const addrType = chunk[offset + 2];
+  const addrLen =
+    addrType === 2
+      ? offset + 3 < len
+        ? chunk[offset + 3]
+        : null
+      : addrType === 1
+        ? 4
+        : addrType === 3
+          ? 16
+          : -1;
+  if (addrLen === null) return (result.needMore = true), result;
+  if (addrLen > 0) {
+    const addrOffset = addrType === 2 ? offset + 4 : offset + 3;
+    const dataOffset = addrOffset + addrLen;
+    if (len < dataOffset) return (result.needMore = true), result;
+    const port = (chunk[offset] << 8) | chunk[offset + 1];
+    result.handshake = new Uint8Array([chunk[0], 0]);
+    result.success = true;
+    // cmd：0x01=TCP / 0x02=UDP / 0x03=MUX
+    result.parsedRequest = { cmd: chunk[18 + chunk[17]], addrType, addrBytes: chunk.subarray(addrOffset, addrOffset + addrLen), dataOffset, port };
+    return result;
+  }
+  return result;
+};
+
+// ==================== 9. 出站选路数据 ====================
+
+// ---------- 官方匹配：按本机出口 colo 拼官方代理域名 ----------
+const OfficialProxyBase = 'proxy.zjcloud.us.ci';
+const officialProxyHost = (colo) => (colo ? `${colo.toLowerCase()}.${OfficialProxyBase}` : OfficialProxyBase);
+
+// ---------- ProxyIP 池（SenflareLink，维护周期 3 小时/次） ----------
+const ProxyIPPool = [
+  { domain: 'Proxy-HK.SenflareLink.kdns.fr', region: 'HK' },
+  { domain: 'Proxy-TW.SenflareLink.kdns.fr', region: 'TW' },
+  { domain: 'Proxy-JP.SenflareLink.kdns.fr', region: 'JP' },
+  { domain: 'Proxy-KR.SenflareLink.kdns.fr', region: 'KR' },
+  { domain: 'Proxy-SG.SenflareLink.kdns.fr', region: 'SG' },
+  { domain: 'Proxy-IN.SenflareLink.kdns.fr', region: 'IN' },
+  { domain: 'Proxy-GB.SenflareLink.kdns.fr', region: 'GB' },
+  { domain: 'Proxy-FR.SenflareLink.kdns.fr', region: 'FR' },
+  { domain: 'Proxy-DE.SenflareLink.kdns.fr', region: 'DE' },
+  { domain: 'Proxy-NL.SenflareLink.kdns.fr', region: 'NL' },
+  { domain: 'Proxy-SE.SenflareLink.kdns.fr', region: 'SE' },
+  { domain: 'Proxy-FI.SenflareLink.kdns.fr', region: 'FI' },
+  { domain: 'Proxy-PL.SenflareLink.kdns.fr', region: 'PL' },
+  { domain: 'Proxy-RU.SenflareLink.kdns.fr', region: 'RU' },
+  { domain: 'Proxy-CH.SenflareLink.kdns.fr', region: 'CH' },
+  { domain: 'Proxy-LV.SenflareLink.kdns.fr', region: 'LV' },
+  { domain: 'Proxy-US.SenflareLink.kdns.fr', region: 'US' },
+  { domain: 'Proxy-CA.SenflareLink.kdns.fr', region: 'CA' }
+];
+
+// ---------- 邻近地区映射 ----------
+const NearbyRegions = {
+  'HK': ['TW', 'SG', 'JP', 'KR', 'IN'],
+  'TW': ['HK', 'JP', 'SG', 'KR', 'IN'],
+  'JP': ['KR', 'TW', 'HK', 'SG'],
+  'KR': ['JP', 'TW', 'HK', 'SG'],
+  'SG': ['JP', 'HK', 'TW', 'IN', 'KR'],
+  'IN': ['SG', 'HK', 'TW', 'KR', 'JP'],
+  'GB': ['FR', 'NL', 'DE', 'CH', 'SE'],
+  'FR': ['GB', 'CH', 'DE', 'NL'],
+  'DE': ['NL', 'FR', 'CH', 'PL', 'GB'],
+  'NL': ['DE', 'GB', 'FR', 'SE', 'FI'],
+  'SE': ['FI', 'LV', 'PL', 'DE', 'GB'],
+  'FI': ['SE', 'LV', 'PL', 'DE'],
+  'PL': ['DE', 'LV', 'SE', 'FI', 'RU'],
+  'RU': ['PL', 'SE', 'FI', 'LV', 'DE'],
+  'CH': ['FR', 'DE', 'GB', 'NL'],
+  'US': ['CA', 'GB', 'FR', 'DE', 'NL'],
+  'CA': ['US', 'GB', 'FR', 'DE', 'NL']
+};
+
+// ---------- CF 机场码 → 池内地区 ----------
+const colosByRegion = {
+  US: 'SJC LAX SEA ORD DFW IAD EWR MIA ATL SLC PHX IAH MSP DEN PDX BOS',
+  CA: 'YYZ YVR YOW YUL',
+  HK: 'HKG',
+  JP: 'NRT KIX',
+  KR: 'ICN',
+  TW: 'TPE',
+  SG: 'SIN',
+  IN: 'BOM DEL MAA BLR',
+  GB: 'LHR MAN',
+  FR: 'CDG MRS',
+  DE: 'FRA HAM DUS',
+  NL: 'AMS',
+  SE: 'ARN GOT',
+  FI: 'HEL',
+  PL: 'WAW',
+  CH: 'ZRH GVA',
+};
+
+// 反向索引：colo → region
+const coloToRegion = new Map();
+for (const [region, colos] of Object.entries(colosByRegion)) {
+  for (const colo of colos.split(' ')) if (colo) coloToRegion.set(colo, region);
+}
+const coloRegion = (c) => coloToRegion.get(c) || null;
+
+// ==================== 10. 建立连接 ====================
+
+/** TCP 建连超时（ms） */
+const CONNECT_TIMEOUT = 1000;
+
+const connectWithTimeout = async (hostname, port) => {
+  // IPv6 字面量剥方括号
+  if (hostname.charCodeAt(0) === 91 && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
+  const socket = connect({ hostname, port });
+  let killer;
+  try {
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => {
+        killer = setTimeout(() => reject(new Error('connect-timeout')), CONNECT_TIMEOUT);
+      }),
+    ]);
+    return socket;
+  } catch (e) {
+    try { socket.close()?.catch?.(() => { }); } catch { }   // 关闭失败/超时的 socket
+    throw e;
+  } finally {
+    clearTimeout(killer);
+  }
+};
+
+/** 智能排序缓存 */
+const smartProxyCache = new Map();
+
+/** ProxyIP 排序：当前地区 → 邻近地区 → 其余 */
+const getSmartProxyList = (region) => {
+  if (smartProxyCache.has(region)) return smartProxyCache.get(region);
+  const nearby = NearbyRegions[region] || [];
+  const rank = (r) => (r === region ? 0 : nearby.includes(r) ? 1 : 2);
+  const list = ProxyIPPool.filter((p) => p.domain)
+    .map((p) => ({ domain: p.domain, r: rank(p.region) }))
+    .sort((a, b) => a.r - b.r)   // 本区 → 邻区 → 其余；同 rank 保持池内顺序（稳定排序）
+    .map((x) => x.domain);
+  smartProxyCache.set(region, list);
+  return list;
+};
+
+/** 按目标确定性洗牌 */
+const stickyShuffle = (list, seedText) => {
+  let seed = 0;
+  for (let i = 0; i < seedText.length; i++) seed = (seed + seedText.charCodeAt(i)) | 0;
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i--) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const j = seed % (i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+};
+
+/** 解析反代候选（内联 > OFFICIAL > CUSTOM/LOCAL > 固定地区 > AUTO） */
+const resolveProxyCandidates = async (conf, region = '', inlineExit = '', inlineExitPort = null, target = '', colo = '') => {
+  const mode = String(conf.ProxyIPMode || 'AUTO').toUpperCase();
+
+  if (inlineExit) return [{ host: inlineExit, port: inlineExitPort }];
+  if (mode === 'OFFICIAL') return [{ host: officialProxyHost(colo), port: null }];
+
+  // CUSTOM/LOCAL：过滤 URL 形态
+  if (mode === 'CUSTOM' || mode === 'LOCAL') {
+    const src = mode === 'LOCAL' ? conf.LocalProxyIP : conf.ProxyIP;
+    const list = String(src || '')
+      .split(/[\s,;]+/)
+      .filter((s) => s && !/^https?:\/\//i.test(s) && !s.includes('/'))
+      .map(parseHostPort)
+      .filter((e) => e && /^(\[[\da-fA-F:]+\]|[\w.-]+)$/.test(e.host));
+    if (list.length) return stickyShuffle(list, target + String(conf.UUID ?? ''));
+  }
+
+  // 固定地区
+  if (/^[A-Z]{2}$/.test(mode)) {
+    const hit = ProxyIPPool.find((p) => p.region === mode);
+    return hit ? [{ host: hit.domain, port: null }] : [];
+  }
+
+  // AUTO：前 ProxyCandidateMax 个池域名预解析后按 IP 竞速
+  const domains = getSmartProxyList(region).slice(0, ProxyCandidateMax);
+  return (await Promise.all(domains.map(async (domain) =>
+    (await resolveHostIps(domain)).map((ip) => ({ host: ip, port: null, via: domain }))
+  ))).flat();
+};
+
+// ---------- Cloudflare 网段判定 ----------
+const CfV4Cidrs = [
+  '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18',
+  '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17',
+  '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+].map((cidr) => {
+  const [ip, bits] = cidr.split('/');
+  const mask = (-1 << (32 - Number(bits))) >>> 0;
+  const base = ip.split('.').reduce((n, s) => n * 256 + Number(s), 0) >>> 0;
+  return [base & mask, mask];
+});
+
+const CfV6Heads = new Set(['2400:cb00', '2606:4700', '2803:f800', '2405:b500', '2405:8100', '2c0f:f248']);
+
+const ipv4ToInt = (ip) => {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const s of parts) {
+    const v = Number(s);
+    if (!/^\d{1,3}$/.test(s) || v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+};
+
+/** 目标 IP 是否为 Cloudflare 网段 */
+const isCfIp = (raw) => {
+  let ip = String(raw || '');
+  if (ip.charCodeAt(0) === 91) ip = ip.slice(1, ip.endsWith(']') ? -1 : undefined);
+  if (ip.includes(':')) {
+    const head = ip.toLowerCase().split(':').slice(0, 2).map((h) => h.replace(/^0+(?=.)/, '')).join(':');
+    return CfV6Heads.has(head) || /^2a06:98c[0-7]$/.test(head);
+  }
+  const n = ipv4ToInt(ip);
+  return n === null ? false : CfV4Cidrs.some(([base, mask]) => (n & mask) === base);
+};
+
+// ---------- 反代主机名 → IP 展开 ----------
+const DnsTtl = 15 * 60 * 1000;
+const DnsCacheMaxEntries = 256;
+const dnsIpCache = new Map();
+
+const isIpLiteral = (host) => host.charCodeAt(0) === 91 || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+
+/** DoH JSON 查 A（最多 4 个，失败回落原域名） */
+const resolveHostIps = async (host) => {
+  if (isIpLiteral(host)) return [host];
+  const hit = dnsIpCache.get(host);
+  if (hit && Date.now() - hit.time < DnsTtl) return hit.ips;
+  const ips = [];
+  // 只查 A（fetch/json 失败已在链内兜底为 null，无需外层捕获）
+  const a = await fetchWithTimeout(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`, 3000, {
+    headers: { accept: 'application/dns-json' },
+  })
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null);
+  for (const r of a?.Answer ?? []) if (r.type === 1 && typeof r.data === 'string') ips.push(r.data);
+  if (!ips.length) {
+    // 全灭时续用过期缓存
+    if (hit) return hit.ips;
+    return [host];
+  }
+  const out = ips.slice(0, 4);
+  if (dnsIpCache.size >= DnsCacheMaxEntries) dnsIpCache.delete(dnsIpCache.keys().next().value);
+  dnsIpCache.set(host, { ips: out, time: Date.now() });
+  return out;
+};
+
+/** 连接日志：[路由] 目标 host:port | 出口 … | 入口 机房/国家/城市 | ASN
+ *  直连出口即目标本身，显示「直连」；反代候选带来源域名时以「← 来自」标注 */
+const logConn = (request, route, target, exitHost, targetPort, via = '') => {
+  const cf = request?.cf || {};
+  const exit = exitHost === target ? '直连' : (via && via !== exitHost ? `${exitHost} ← 来自 ${via}` : exitHost);
+  const loc = [cf.colo, cf.country, cf.city].filter(Boolean).join(' / ') || '-';
+  console.log(`[${route}] 目标 ${target}:${targetPort} | 出口 ${exit} | 入口 ${loc} | ASN ${cf.asn || '-'}`);
+};
+
+// ---------- 候选连接 ----------
+
+const ProxyCandidateMax = 6;   // 候选上限
+const ProxyDialBatch = 6;      // 每批并发连接数（对齐平台同时外连上限），失败 socket 立即关闭
+
+/** 候选失败记忆：30s 内拨败的候选在多候选可选时跳过 */
+const ProxyFailTtl = 30 * 1000;
+const failedProxies = new Map();
+const proxyFailKey = (c, port) => `${c.host}:${c.port ?? port}`;
+const proxyFailedRecently = (key) => (failedProxies.get(key) ?? 0) > Date.now();
+const markProxyKey = (key) => {
+  failedProxies.set(key, Date.now() + ProxyFailTtl);
+  if (failedProxies.size > 256) for (const [k, v] of failedProxies) if (v <= Date.now()) failedProxies.delete(k);   // 防胀：顺手清过期键
+};
+const markProxiesFailed = (candidates, port) => { for (const c of candidates) markProxyKey(proxyFailKey(c, port)); };
+
+/** 候选竞速拨号：首包写给最快连上的那个，写失败顺位换下一个 */
+const raceDial = async (batch, targetPort, payload) => {
+  const shut = (s) => { try { s.close()?.catch?.(() => { }); } catch { } };
+  const pending = new Set();
+  for (const c of batch) {
+    const p = connectWithTimeout(c.host, c.port ?? targetPort).then((socket) => ({ socket, host: c.host, cport: c.port, via: c.via, p }));
+    pending.add(p);
+    p.catch(() => pending.delete(p));
+  }
+  while (pending.size) {
+    let first;
+    try { first = await Promise.any(pending); } catch { break; }   // 这批全都没连上
+    pending.delete(first.p);
+    try {
+      if (payload?.byteLength) {
+        const writer = first.socket.writable.getWriter();
+        try { await writer.write(payload); } finally { try { writer.releaseLock(); } catch { } }
+      }
+      for (const p of pending) p.then((r) => shut(r.socket)).catch(() => { });   // 落败者全部关闭，含此刻还没连上的
+      return { socket: first.socket, host: first.host, cport: first.cport, via: first.via };
+    } catch {
+      shut(first.socket);
+    }
+  }
+  throw new Error('all-candidates-failed');
+};
+
+/** 逐批把整张候选表都试一遍；失败返回 null */
+const dialCandidates = async (candidates, targetPort, payload) => {
+  for (let i = 0; i < candidates.length; i += ProxyDialBatch) {
+    try {
+      return await raceDial(candidates.slice(i, i + ProxyDialBatch), targetPort, payload);
+    } catch { }
+  }
+  return null;
+};
+
+/** 建立连接三级：① 直连（Outbound=auto）→ ② 候选反代逐批竞速 → ③ ProxyIPMax 兜底（fixed 无兜底）*/
+const establishTcpConnection = async (parsedRequest, request, hostname, payload) => {
+  const port = parsedRequest.port;
+
+  // 链接内联出口：/proxyip=host /proxyip.host /pyip= /ip= 或 ?proxyip=host 指定本连接的出站反代，host:port 格式亦可
+  const url = new URL(request.url);
+  const inlineRaw = (url.searchParams.get('proxyip') || url.searchParams.get('proxy') || url.pathname.match(/\/(?:proxyip|pyip|ip)[.=]([^?#\s]+)/i)?.[1] || '').replace(/\/+$/, '');
+  const inlineParsed = inlineRaw ? parseHostPort(inlineRaw) : null;
+  const inlineExit = inlineParsed?.host || inlineRaw;
+  const inlineExitPort = inlineParsed?.port ?? null;
+
+  const conf = await loadNodeConfig();
+  const outbound = String(conf.Outbound ?? 'auto').trim().toLowerCase();
+  const forceProxy = outbound === 'global' || outbound === 'fixed';
+  // 日志用出站标签：内联出口优先，否则即反代模式本身
+  const proxyTag = inlineExit ? 'INLINE' : String(conf.ProxyIPMode || 'AUTO').toUpperCase();
+  let tried = 0;
+
+  // 一级：直连（global/fixed 跳过）；CF 预判与拨号并行，判 CF 即弃用直连走反代
+  // 预判限时 400ms：超时按非 CF 放行——平台拒绝 Worker 连 CF IP，真 CF 目标在拨号侧自然失败
+  if (!forceProxy) {
+    let cfTimer;
+    const [isCf, direct] = await Promise.all([
+      Promise.race([
+        resolveHostIps(hostname).then((ips) => ips.every(isCfIp)),
+        new Promise((r) => { cfTimer = setTimeout(() => r(false), 400); }),
+      ]).finally(() => clearTimeout(cfTimer)),
+      raceDial([{ host: hostname, port }], port, payload).catch(() => null),
+    ]);
+    if (direct && !isCf) {
+      logConn(request, '直连', hostname, direct.host, port);
+      return { ...direct, exitKey: null };   // 直连出口不记失败记忆
+    }
+    if (direct) { try { direct.socket.close()?.catch?.(() => { }); } catch { } }   // CF 命中：弃用已拨 socket
+  }
+
+  // 二级：候选反代竞速
+  try {
+    const colo = String(request.cf?.colo || '').toUpperCase();
+    const regionHint = coloRegion(colo) ?? request.cf?.country ?? '';
+    let candidates = (await resolveProxyCandidates(conf, regionHint, inlineExit, inlineExitPort, hostname, colo)).filter((c) => c?.host);
+    // 候选太少时才拆域名（并行解析）
+    if (candidates.length && candidates.length <= 2) {
+      const expanded = await Promise.all(candidates.map(async (c) =>
+        (await resolveHostIps(c.host)).map((ip) => ({ host: ip, port: c.port, via: c.host }))
+      ));
+      candidates = expanded.flat();
+    }
+    // 去重后截断
+    const seen = new Set();
+    candidates = candidates
+      .filter((c) => !seen.has(`${c.host}:${c.port ?? port}`) && seen.add(`${c.host}:${c.port ?? port}`))
+      .slice(0, ProxyCandidateMax);
+    // 跳过 30s 内拨败过的候选
+    if (candidates.length > 1) {
+      const fresh = candidates.filter((c) => !proxyFailedRecently(proxyFailKey(c, port)));
+      if (fresh.length) candidates = fresh;
+    }
+    tried += candidates.length;
+    const hit = await dialCandidates(candidates, port, payload);
+    if (hit) { logConn(request, `反代 / ${proxyTag}`, hostname, hit.host, port, hit.via); return { ...hit, exitKey: proxyFailKey({ host: hit.host, port: hit.cport }, port) }; }
+    markProxiesFailed(candidates, port); 
+  } catch { }
+
+  // 三级：兜底反代（fixed 无兜底）
+  if (outbound !== 'fixed') {
+    try {
+      const fallback = parseHostPort(conf.ProxyIPMax);
+      if (fallback?.host) {
+        const pool = (await resolveHostIps(fallback.host)).map((ip) => ({ host: ip, port: fallback.port, via: fallback.host }));
+        const batch = pool.slice(0, ProxyDialBatch * 2);
+        const usable = batch.filter((c) => !proxyFailedRecently(proxyFailKey(c, port)));
+        const tryBatch = usable.length ? usable : batch;
+        tried += tryBatch.length;
+        const hit = await dialCandidates(tryBatch, port, payload);
+        if (hit) { logConn(request, '兜底反代', hostname, hit.host, port, hit.via); return { ...hit, exitKey: proxyFailKey({ host: hit.host, port: hit.cport }, port) }; }
+        markProxiesFailed(tryBatch, port);
+      }
+    } catch { }
+  }
+  logConn(request, `全部失败 / ${proxyTag}`, hostname, `全部失败 [（${tried} ]个节点均无法连接）`, port);
+  return null;
+};
+
+// ==================== 11. DoH 劫持（53 端口） ====================
+
+const dohEndpoints = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'];
+
+/** DoH 端点：合法 URL 单端点直用，否则默认双端点 */
+const getDohEndpoints = async () => {
+  const v = String((await loadNodeConfig()).Doh ?? '').trim();
+  return /^https?:\/\//i.test(v) ? [v] : dohEndpoints;
+};
+
+// DoH 应答缓存
+const DohCacheMaxEntries = 256;
+const dohCache = new Map();
+
+const dnsQuestionKey = (msg) => {
+  if (msg.byteLength < 17 || (msg[2] >> 3 & 0xf) !== 0 || ((msg[4] << 8) | msg[5]) === 0) throw 0;
+  const labels = [];
+  let off = 12;
+  for (let l; (l = msg[off]); off++) {
+    if (l > 63 || (off += l) + 1 >= msg.byteLength) throw 0;
+    labels.push(String.fromCharCode(...msg.subarray(off - l + 1, off + 1)));
+  }
+  if (off + 5 > msg.byteLength) throw 0;
+  return { key: `${labels.join('.').toLowerCase()}/${(msg[off + 1] << 8) | msg[off + 2]}`, end: off + 5 };
+};
+
+/** 应答段最小 TTL（毫秒），越界视为不可缓存 */
+const dnsMinAnswerTtlMs = (msg, start) => {
+  let off = start;
+  let ttlMin = Infinity;
+  const skipName = () => {
+    for (; ;) {
+      if (off >= msg.byteLength) throw 0;
+      const l = msg[off];
+      if (l === 0) { off++; return; }
+      if ((l & 0xc0) === 0xc0) { off += 2; return; }   // 压缩指针
+      off += l + 1;
+    }
+  };
+  const anCount = (msg[6] << 8) | msg[7];
+  if (!anCount || msg[3] & 0xf) throw 0;
+  for (let i = 0; i < anCount; i++) {
+    skipName();
+    if (off + 10 > msg.byteLength) throw 0;
+    const rdLen = (msg[off + 8] << 8) | msg[off + 9];
+    if (off + 10 + rdLen > msg.byteLength) throw 0;
+    ttlMin = Math.min(ttlMin, ((msg[off + 4] << 24 | msg[off + 5] << 16 | msg[off + 6] << 8 | msg[off + 7]) >>> 0));
+    off += 10 + rdLen;
+  }
+  return Math.min(Math.max(ttlMin * 1000, 10 * 1000), 300 * 1000);
+};
+
+/** 缓存命中应答 */
+const cachedDohAnswer = (entry, dnsQuery) => {
+  const out = new Uint8Array(new Uint8Array(entry.data));
+  out[0] = dnsQuery[0];
+  out[1] = dnsQuery[1];
+  return out.buffer;
+};
+
+/** DNS 查询转 DoH：缓存 → 主端点先行 + 250ms 对冲补发 → 全失效时用过期缓存兜底 */
+const DohHedgeDelay = 250;
+
+const dohQuery = async (dnsQuery) => {
+  if (!(dnsQuery instanceof Uint8Array)) dnsQuery = new Uint8Array(dnsQuery);
+  let missInfo = null;
+  try {
+    const { key, end } = dnsQuestionKey(dnsQuery);
+    const hit = dohCache.get(key);
+    if (hit && Date.now() < hit.expires) {
+      dohCache.delete(key), dohCache.set(key, hit);
+      return cachedDohAnswer(hit, dnsQuery);
+    }
+    missInfo = { key, end };
+  } catch { }
+  const endpoints = await getDohEndpoints();
+  const ac = new AbortController();
+  const attempt = (endpoint) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message' },
+      body: dnsQuery,
+      signal: ac.signal,
+    }).then((r) => {
+      if (!r.ok) throw new Error('doh');
+      return r.arrayBuffer();
+    });
+  let resp;
+  try {
+    resp = await new Promise((resolve, reject) => {
+      let settled = false;
+      let inflight = 0;
+      let queued = endpoints.length - 1; 
+      let hedgeTimer = null;
+      const settle = (fn, v) => {
+        if (settled) return;
+        settled = true;
+        hedgeTimer && (clearTimeout(hedgeTimer), (hedgeTimer = null));
+        clearTimeout(killTimer);
+        try { ac.abort(); } catch { }
+        fn(v);
+      };
+      const killTimer = setTimeout(() => settle(reject, new Error('doh-timeout')), 5000);
+      const win = (v) => settle(resolve, v);
+      const fail = () => { if (!inflight && !queued) settle(reject, new Error('doh')); };
+      const launch = (endpoint) => { inflight++; attempt(endpoint).then(win, () => { inflight--; fail(); }); };
+      launch(endpoints[0]);
+      if (queued > 0) hedgeTimer = setTimeout(() => { hedgeTimer = null; for (const ep of endpoints.slice(1)) { queued--; launch(ep); } }, DohHedgeDelay);
+    });
+  } catch (e) {
+    if (missInfo) {
+      const stale = dohCache.get(missInfo.key);
+      if (stale) {
+        dohCache.delete(missInfo.key), dohCache.set(missInfo.key, stale);
+        stale.expires = Date.now() + 10 * 1000;
+        return cachedDohAnswer(stale, dnsQuery);
+      }
+    }
+    throw e;
+  }
+  if (missInfo) {
+    try {
+      const ttlMs = dnsMinAnswerTtlMs(new Uint8Array(resp), missInfo.end);
+      dohCache.set(missInfo.key, { data: resp, expires: Date.now() + ttlMs });
+      if (dohCache.size > DohCacheMaxEntries) dohCache.delete(dohCache.keys().next().value);
+    } catch { }
+  }
+  return resp;
+};
+
+/* DNS 报文加 2 字节大端长度帧（TCP-DNS / UDP-DNS 回包共用） */
+const frameDns = (resp) => {
+  const body = resp instanceof Uint8Array ? resp : new Uint8Array(resp);
+  const out = new Uint8Array(2 + body.byteLength);
+  out[0] = body.byteLength >> 8;
+  out[1] = body.byteLength & 0xff;
+  out.set(body, 2);
+  return out;
+};
+
+/* TCP-DNS 封装 */
+const dohResolve = async (dnsQuery) => frameDns(await dohQuery(dnsQuery));
+
+/* UDP-DNS 应答 */
+const sendUdpDnsAnswer = async (query, writable) => {
+  if (!query?.byteLength) return;
+  await writable.send(frameDns(await dohQuery(query)));
+};
+
+const feedFrames = async (chunk, state, remainKey, writable, close, answer) => {
+  if (!chunk?.byteLength) return;
+  const remain = state[remainKey];
+  let buf = chunk;
+  if (remain?.length) {
+    buf = new Uint8Array(remain.length + chunk.length);
+    buf.set(remain);
+    buf.set(chunk, remain.length);
+  }
+  let off = 0;
+  while (buf.length - off >= 2) {
+    const len = (buf[off] << 8) | buf[off + 1];
+    if (len <= 0 || buf.length - off < 2 + len) break;
+    try { await answer(buf.subarray(off + 2, off + 2 + len)); } catch { }
+    off += 2 + len;
+  }
+  if (off >= buf.length) return void (state[remainKey] = null);
+  const rest = buf.slice(off);
+  if (rest.length > 65537) { state[remainKey] = null; return close(true); }
+  state[remainKey] = rest;
+};
+
+const feedUdpDns = (chunk, state, writable, close) =>
+  feedFrames(chunk, state, 'udpRemain', writable, close, (frame) => sendUdpDnsAnswer(frame, writable));
+
+/** TCP-DNS 持续会话：单连接多查询，空闲 5 分钟收尾 */
+const DnsIdleTimeout = 5 * 60 * 1000;
+
+const feedTcpDns = async (chunk, state, writable, close) => {
+  state.dnsIdleTimer && clearTimeout(state.dnsIdleTimer);
+  state.dnsIdleTimer = setTimeout(() => { state.dnsIdleTimer = null; close(false); }, DnsIdleTimeout);   // 空闲发 1000 关闭
+  await feedFrames(chunk, state, 'dnsRemain', writable, close, (frame) => dohResolve(frame).then(writable.send));
+};
+
+// ==================== 12. 传输层 ====================
+
+const maxChunkLen = 64 * 1024;                          // 单次切片上限：64KB
+const MaxQueuedBytes = 8 * 1024 * 1024;                 // 入站队列字节上限：8MB
+const QueueSlots = 2048;                                // 入站环形队列槽位
+const FlushTarget = 32 * 1024;                          // 下行攒包目标：32KB
+const DirectChunkMin = 32 * 1024;                       // 零拷贝直发下限：32KB
+const FirstByteTimeout = 3500;                          // 首字节超时默认值（ms）
+
+/** 首字节看门狗时长（ms），D1 FirstByteTimeout 可覆盖 */
+const getFirstByteTimeout = async () => {
+  const v = Number((await loadNodeConfig()).FirstByteTimeout);
+  return Number.isFinite(v) && v >= 1000 && v <= 30000 ? v : FirstByteTimeout;
+};
+
+/** BYOB 手动管道：TCP → WebSocket。
+ *  首块 ≥32KB 零拷贝直发，小块攒到 32KB 出帧；只设首字节看门狗，不设空闲看门狗
+ *  onBlackhole：看门狗触发（黑洞判定）时回调，把本次出口记入失败记忆 */
+const manualPipe = async (readable, writable, close, onBlackhole) => {
+  let grain = null;          // 攒包缓冲
+  let grainLen = 0;
+  let timerId = null;
+  let serial = Promise.resolve();
+  let serialSendError = null;
+  let readBuf = new ArrayBuffer(maxChunkLen);
+
+  // send 链：保序 + 收集首个发送错误
+  const sendRaw = (chunk) => {
+    serial = serial.then(() => {
+      try { writable.send(chunk); } catch (e) { serialSendError ||= e; }
+    });
+    return serial;
+  };
+
+  const flush = async () => {
+    timerId && (clearTimeout(timerId), (timerId = null));
+    if (grainLen > 0) {
+      const out = grain.subarray(0, grainLen);   // 零拷贝出帧
+      grainLen = 0;
+      await sendRaw(out);
+    }
+  };
+
+  const reader = readable.getReader({ mode: 'byob' });
+  // 首字节看门狗：时限内目标无一字节回传即断开；onBlackhole 把黑洞出口记入失败记忆
+  let firstByte = false;
+  let stallTimer = setTimeout(() => { stallTimer = null; if (!firstByte) { try { reader.cancel().catch(() => { }); } catch { } if (close) close(true); if (onBlackhole) onBlackhole(); } }, await getFirstByteTimeout());
+  const clearStall = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; } };
+  // 块处理：直发（grain 空 & 块够大）或进攒包
+  const handleChunk = async (value) => {
+    const chunkLen = value?.byteLength || 0;
+    if (!chunkLen) return;
+    if (!firstByte) { firstByte = true; clearStall(); }
+    // grain 有残量且攒不下时先冲掉
+    if (grainLen > 0 && grainLen + chunkLen > FlushTarget) await flush();
+    if (grainLen === 0 && chunkLen >= DirectChunkMin) {
+      // grain 空且块够大：零拷贝直发
+      await sendRaw(value.subarray());
+    } else {
+      grain ||= new Uint8Array(FlushTarget);
+      grain.set(value, grainLen);
+      grainLen += chunkLen;
+      if (grainLen >= FlushTarget) await flush();
+      else timerId ||= setTimeout(() => { timerId = null; flush(); }, 1);
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read(new Uint8Array(readBuf));
+      if (done) break;
+      if (serialSendError) throw serialSendError; 
+      // BYOB 缓冲回收：webSocket.send 同步消费完数据，返回缓冲直接续读（等长校验兜异常实现），稳态零分配
+      readBuf = value.buffer.byteLength === maxChunkLen ? value.buffer : new ArrayBuffer(maxChunkLen);
+      await handleChunk(value);
+    }
+  } catch {
+    if (close) close(true);   // 读循环异常：静默回收
+  } finally {
+    clearStall();
+    timerId && (clearTimeout(timerId), (timerId = null));
+    try { await flush(); } catch { }
+    try { await serial; } catch { }
+    if (serialSendError && close) close(true);   // 下行 send 失败：清资源
+  }
+};
+
+/** 微任务环形队列（槽位 QueueSlots + 小包合并 + 字节上限 MaxQueuedBytes） */
+const createAsyncMicrotaskQueue = (consume, close) => {
+  const queue = new Array(QueueSlots);
+  const mask = QueueSlots - 1;
+  let head = 0;
+  let tail = 0;
+  let size = 0;
+  let queuedBytes = 0;
+  let coalesceBuffer = null;
+  let drainActive = false;
+  let closed = false;
+  let idleNotify = null; 
+  const closeQueue = () => {
+    if (closed) return;
+    closed = true;
+    queue.fill(null);
+    queuedBytes = 0;
+    close?.(true);
+    const notify = idleNotify;
+    (idleNotify = null), notify?.();
+  };
+  const shift = () => {
+    const chunk = queue[head];
+    (queue[head] = null), (head = (head + 1) & mask), size--, (queuedBytes -= chunk.byteLength);
+    return chunk;
+  };
+  const notifyIfIdle = () => {
+    if (size === 0 && !drainActive && idleNotify) {
+      const notify = idleNotify;
+      (idleNotify = null), notify();
+    }
+  };
+  const drainQueue = async () => {
+    if (closed) return;
+    try {
+      while (size > 0 && !closed) {
+        if (!enqueue.writer) {
+          await consume(shift());
+          continue;
+        }
+        let chunk = queue[head];
+        if (chunk.byteLength >= maxChunkLen) {
+          await enqueue.writer.write(shift());
+          continue;
+        }
+        let mergedLength = 0;
+        coalesceBuffer ||= new Uint8Array(maxChunkLen);
+        while (size > 0 && mergedLength + queue[head].byteLength <= maxChunkLen) {
+          chunk = shift();
+          coalesceBuffer.set(chunk, mergedLength);
+          mergedLength += chunk.byteLength;
+        }
+        if (mergedLength > 0) await enqueue.writer.write(coalesceBuffer.subarray(0, mergedLength));
+      }
+    } catch {
+      closeQueue();
+    } finally {
+      (drainActive = false), notifyIfIdle();
+    }
+  };
+  const enqueue = (chunk) => {
+    if (closed) return;
+    chunk = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk);
+    if (enqueue.writer && !chunk.byteLength) return;
+    if (size === QueueSlots || queuedBytes + chunk.byteLength > MaxQueuedBytes) return closeQueue();
+    (queue[tail] = chunk), (tail = (tail + 1) & mask), size++, (queuedBytes += chunk.byteLength);
+    if (!drainActive) (drainActive = true), queueMicrotask(drainQueue);
+  };
+  /** 排干通知：队列已空时立即回调 */
+  enqueue.onIdle = (cb) => {
+    if (closed || (size === 0 && !drainActive)) return cb();
+    idleNotify = cb;
+  };
+  return enqueue;
+};
+
+// ==================== 13. 首页伪装反代 ====================
+
+/** 首页伪装固定目标 */
+const FakeUrl = 'https://cybermap.kaspersky.com/';
+
+/** 伪装反代：非代理请求反代到 FakeUrl */
+const FakeRewriteMax = 2 * 1024 * 1024;
+const FakePassHeaders = ['user-agent', 'accept', 'accept-language', 'content-type'];
+
+const handleFakePage = async (request) => {
+  const url = new URL(request.url);
+  // 缓存键归一化到路径级
+  const cacheKey = url.origin + url.pathname;
+  const cache = globalThis.caches?.default;
+  if (cache && request.method === 'GET') {
+    try {
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+    } catch { }
+  }
+  try {
+    const fakeURL = new URL(FakeUrl);
+    const headers = new Headers();
+    for (const h of FakePassHeaders) {
+      const v = request.headers.get(h);
+      if (v) headers.set(h, v);
+    }
+    headers.set('Referer', fakeURL.origin);
+    headers.set('Origin', fakeURL.origin);
+    headers.set('Accept-Encoding', 'identity');
+
+    const response = await fetchWithTimeout(
+      fakeURL.origin + url.pathname + url.search,
+      8000,
+      { method: request.method, headers, body: request.body },
+    );
+
+    const contentType = response.headers.get('content-type') || '';
+    if (/text|javascript|json|xml/.test(contentType)) {
+      const lenHeader = response.headers.get('content-length');
+      const len = lenHeader == null ? NaN : Number(lenHeader);
+      const outHeaders = { ...Object.fromEntries(response.headers), 'Cache-Control': 'no-store' };
+      // 长度可靠且 ≤2MB 的文本进内存改写，其余流式透传
+      if (!Number.isFinite(len) || len > FakeRewriteMax) {
+        return new Response(response.body, { status: response.status, headers: outHeaders });
+      }
+      delete outHeaders['content-encoding'];
+      delete outHeaders['content-length'];
+      const content = (await response.text()).replaceAll(fakeURL.host, url.host);
+      const out = new Response(content, { status: response.status, headers: outHeaders });
+      // 成功 GET 文本页写回边缘缓存
+      if (cache && request.method === 'GET' && response.status === 200 && !response.headers.has('set-cookie')) {
+        try {
+          const cachedCopy = out.clone();
+          cachedCopy.headers.set('Cache-Control', 'public, max-age=3600');
+          cachedCopy.headers.delete('vary');
+          await cache.put(cacheKey, cachedCopy);
+        } catch { }
+      }
+      return out;
+    }
+    return response;
+  } catch {
+    return unknownResp();
+  }
+};
